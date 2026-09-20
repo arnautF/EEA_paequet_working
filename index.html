@@ -49,6 +49,7 @@ h1{font-size:27px;margin:0;letter-spacing:-.03em}
 .meta-heading{grid-column:1/-1;font-weight:700;font-size:14px;margin-top:2px}
 .metadata-warning{grid-column:1/-1;background:#fff7e6;border:1px solid #e6c77a;color:#684b08;padding:10px 12px;border-radius:4px;line-height:1.45}
 .tablewrap{overflow:auto;border:1px solid var(--line);border-radius:11px;max-height:500px;background:#fff}
+.preview-table{max-height:none;overflow-x:auto;overflow-y:visible}
 table{border-collapse:collapse;width:100%;font-size:12px}
 th,td{border-bottom:1px solid var(--line);padding:9px 10px;text-align:left;white-space:nowrap;max-width:360px;overflow:hidden;text-overflow:ellipsis}
 th{position:sticky;top:0;background:#f8fafc;z-index:1;font-weight:750}
@@ -64,6 +65,10 @@ tbody tr:hover td{background:#fbfdff}
 .chartbox{height:390px;border:1px solid var(--line);border-radius:4px;padding:12px}
 .pagination{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:12px;font-size:12px;color:var(--muted)}
 .pager-buttons{display:flex;gap:6px}
+.preview-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.day-jump{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.day-jump label{font-size:12px;color:var(--muted);font-weight:600}
+.day-jump input{width:88px}
 .export-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
 .export-card{border:1px solid var(--line);border-radius:4px;padding:14px}
 .export-card h3{margin:0 0 6px;font-size:15px}
@@ -174,14 +179,21 @@ tbody tr:hover td{background:#fbfdff}
         <div class="card">
           <div class="section-head">
             <h2>Data preview</h2>
-            <div style="display:flex;gap:8px;align-items:center">
+            <div class="preview-controls">
               <span id="previewInfo" class="badge"></span>
-              <select id="pageSize" class="control" style="width:auto" onchange="changePageSize()">
-                <option>25</option><option selected>50</option><option>100</option><option>250</option>
+              <label for="daysPerPage" style="font-size:12px;color:var(--muted);font-weight:600">Days per page</label>
+              <select id="daysPerPage" class="control" style="width:auto" onchange="changeDaysPerPage()">
+                <option selected>1</option><option>2</option><option>3</option><option>4</option><option>7</option><option>10</option><option>14</option><option>30</option>
               </select>
+              <div class="day-jump">
+                <label for="dayOfYear">Day of year</label>
+                <input id="dayOfYear" class="control" type="number" min="1" max="366" step="1" placeholder="1–366"
+                       onkeydown="if(event.key==='Enter') jumpToDayOfYear()">
+                <button class="btn small" onclick="jumpToDayOfYear()">Go</button>
+              </div>
             </div>
           </div>
-          <div id="previewTable" class="tablewrap"></div>
+          <div id="previewTable" class="tablewrap preview-table"></div>
           <div class="pagination">
             <span id="pageInfo">—</span>
             <div class="pager-buttons">
@@ -256,7 +268,7 @@ import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.32.0
 
 const state = {
   db:null, conn:null, files:[], current:null, schema:[], fileMeta:null,
-  page:0, pageSize:50, rowCount:0, chart:null, metadataPromise:null, metadataReady:false, metadataError:null
+  page:0, daysPerPage:1, rowCount:0, previewDays:[], chart:null, metadataPromise:null, metadataReady:false, metadataError:null
 };
 
 const $ = id => document.getElementById(id);
@@ -373,6 +385,7 @@ async function selectFile(id){
     state.schema=state.current.schema;
     state.fileMeta=state.current.fileMeta;
     state.page=0;
+    state.previewDays=[];
     await state.conn.query(`CREATE OR REPLACE VIEW current_data AS SELECT * FROM read_parquet(${escLit(state.current.virtual)})`);
     state.rowCount=Number((await rows(`SELECT count(*) AS n FROM current_data`))[0].n);
     $("emptyState").style.display="none";
@@ -519,22 +532,190 @@ function populateChartControls(){
   if(value||numeric[0]) y.value=(value||numeric[0]).column_name;
 }
 
+function getPreviewTimeColumn(){
+  return state.schema.find(c=>c.column_name.toLowerCase()==="start")
+      || state.schema.find(c=>isTemporal(c.column_type))
+      || null;
+}
+
+function timestampExpr(column){
+  const id=escIdent(column.column_name);
+  const type=column.column_type||"";
+
+  if(isTemporal(type)) return id;
+
+  if(isNumeric(type)){
+    // EEA files may store Start/End as Unix epoch values.
+    // 1e11 cleanly separates normal epoch seconds (~1.7e9) from milliseconds (~1.7e12).
+    return `CASE
+      WHEN TRY_CAST(${id} AS DOUBLE) IS NULL THEN NULL
+      WHEN ABS(TRY_CAST(${id} AS DOUBLE)) >= 100000000000
+        THEN to_timestamp(TRY_CAST(${id} AS DOUBLE) / 1000.0)
+      ELSE to_timestamp(TRY_CAST(${id} AS DOUBLE))
+    END`;
+  }
+
+  // Text columns: first try a normal timestamp; if the text is numeric,
+  // interpret it as Unix seconds/milliseconds.
+  return `CASE
+    WHEN TRY_CAST(${id} AS TIMESTAMP) IS NOT NULL THEN TRY_CAST(${id} AS TIMESTAMP)
+    WHEN TRY_CAST(${id} AS DOUBLE) IS NOT NULL THEN
+      CASE
+        WHEN ABS(TRY_CAST(${id} AS DOUBLE)) >= 100000000000
+          THEN to_timestamp(TRY_CAST(${id} AS DOUBLE) / 1000.0)
+        ELSE to_timestamp(TRY_CAST(${id} AS DOUBLE))
+      END
+    ELSE NULL
+  END`;
+}
+
+async function loadPreviewDays(){
+  const timeCol=getPreviewTimeColumn();
+  if(!timeCol) return [];
+  const id=escIdent(timeCol.column_name);
+  const tsExpr=timestampExpr(timeCol);
+
+  // A "day" is defined from 00:00:00 inclusive to the following midnight.
+  // Only calendar days that actually occur in the file are included.
+  return await rows(`
+    SELECT DISTINCT CAST(CAST(date_trunc('day', ${tsExpr}) AS DATE) AS VARCHAR) AS day
+    FROM current_data
+    WHERE ${id} IS NOT NULL
+      AND ${tsExpr} IS NOT NULL
+    ORDER BY day
+  `);
+}
+
+function previewTimeParts(){
+  const timeCol=getPreviewTimeColumn();
+  if(!timeCol) return null;
+  const id=escIdent(timeCol.column_name);
+  const tsExpr=timestampExpr(timeCol);
+  return {timeCol,id,tsExpr};
+}
+
+window.jumpToDayOfYear=async function(){
+  if(!state.current)return;
+  clearError();
+
+  const input=$("dayOfYear");
+  const day=Math.floor(Number(input.value));
+  if(!Number.isFinite(day)||day<1||day>366){
+    error("Enter a day of year from 1 to 366.");
+    return;
+  }
+
+  const tp=previewTimeParts();
+  if(!tp){
+    error("Day-of-year navigation requires a date/time column (for example, Start).");
+    return;
+  }
+
+  busy(true);
+  try{
+    if(!state.previewDays.length) state.previewDays=await loadPreviewDays();
+
+    const match=await rows(`
+      SELECT CAST(CAST(date_trunc('day', ${tp.tsExpr}) AS DATE) AS VARCHAR) AS day
+      FROM current_data
+      WHERE ${tp.id} IS NOT NULL
+        AND ${tp.tsExpr} IS NOT NULL
+        AND EXTRACT(DOY FROM ${tp.tsExpr})=${day}
+      ORDER BY ${tp.tsExpr}
+      LIMIT 1
+    `);
+
+    if(!match.length){
+      error(`No values were found for day ${day} of the year in this file.`);
+      return;
+    }
+
+    const target=String(match[0].day).slice(0,10);
+    const idx=state.previewDays.findIndex(x=>String(x.day).slice(0,10)===target);
+    if(idx<0){
+      error(`Day ${day} could not be located in the preview.`);
+      return;
+    }
+
+    state.daysPerPage=Math.max(1,Number($("daysPerPage").value)||1);
+    state.page=Math.floor(idx/state.daysPerPage);
+    await renderPreview();
+  }catch(e){error(e)}
+  finally{busy(false)}
+};
+
 async function renderPreview(){
   if(!state.current) return;
   clearError();
+
   try{
-    state.pageSize=Number($("pageSize").value);
-    const offset=state.page*state.pageSize;
-    const displayColumns=state.schema.map(c=>(isTemporal(c.column_type)||isDecimal(c.column_type))
-      ? `CAST(${escIdent(c.column_name)} AS VARCHAR) AS ${escIdent(c.column_name)}`
-      : escIdent(c.column_name)).join(", ");
-    const data=await rows(`SELECT ${displayColumns} FROM current_data LIMIT ${state.pageSize} OFFSET ${offset}`);
+    const tp=previewTimeParts();
+    if(!tp){
+      $("previewTable").innerHTML='<div style="padding:18px;color:#667085">A date/time column is required to browse the data by full calendar days.</div>';
+      $("pageInfo").textContent="—";
+      $("previewInfo").textContent=`${fmtInt(state.rowCount)} rows`;
+      return;
+    }
+
+    state.daysPerPage=Math.max(1,Number($("daysPerPage").value)||1);
+    if(!state.previewDays.length) state.previewDays=await loadPreviewDays();
+
+    const totalDays=state.previewDays.length;
+    const totalPages=Math.max(1,Math.ceil(totalDays/state.daysPerPage));
+    if(state.page>=totalPages) state.page=totalPages-1;
+    if(state.page<0) state.page=0;
+
+    const firstDayIndex=state.page*state.daysPerPage;
+    const lastDayIndex=Math.min(firstDayIndex+state.daysPerPage,totalDays)-1;
+
+    if(totalDays===0 || lastDayIndex<firstDayIndex){
+      renderTable("previewTable",[]);
+      $("pageInfo").textContent="No dated observations";
+      $("previewInfo").textContent=`${fmtInt(state.rowCount)} rows`;
+      return;
+    }
+
+    const firstDay=String(state.previewDays[firstDayIndex].day).slice(0,10);
+    const lastDay=String(state.previewDays[lastDayIndex].day).slice(0,10);
+
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(firstDay) || !/^\d{4}-\d{2}-\d{2}$/.test(lastDay)){
+      throw new Error(`Could not determine calendar-day boundaries from the Start field (${firstDay} to ${lastDay}).`);
+    }
+
+    const displayColumns=state.schema.map(c=>{
+      const name=c.column_name.toLowerCase();
+      if((name==="start"||name==="end") && isNumeric(c.column_type)){
+        return `CAST(${timestampExpr(c)} AS VARCHAR) AS ${escIdent(c.column_name)}`;
+      }
+      return (isTemporal(c.column_type)||isDecimal(c.column_type))
+        ? `CAST(${escIdent(c.column_name)} AS VARCHAR) AS ${escIdent(c.column_name)}`
+        : escIdent(c.column_name);
+    }).join(", ");
+
+    /*
+      Important: the preview is selected by TIME, not by row count.
+      It always starts at 00:00 on the first selected calendar day and
+      ends before 00:00 on the day after the final selected calendar day.
+      Therefore missing/duplicate hourly observations do not shift the
+      next page into the middle of a day.
+    */
+    const data=await rows(`
+      SELECT ${displayColumns}
+      FROM current_data
+      WHERE ${tp.tsExpr} >= CAST(${escLit(firstDay)} AS TIMESTAMP)
+        AND ${tp.tsExpr} < CAST(${escLit(lastDay)} AS TIMESTAMP) + INTERVAL 1 DAY
+      ORDER BY ${tp.tsExpr}, ${tp.id}
+    `);
+
     renderTable("previewTable",data);
-    const start=state.rowCount?offset+1:0, end=Math.min(offset+data.length,state.rowCount);
-    $("pageInfo").textContent=`Rows ${fmtInt(start)}–${fmtInt(end)} of ${fmtInt(state.rowCount)}`;
-    $("previewInfo").textContent=`${fmtInt(state.rowCount)} rows`;
+
+    const shownDays=lastDayIndex-firstDayIndex+1;
+    const dayLabel=shownDays===1 ? firstDay : `${firstDay} – ${lastDay}`;
+    $("pageInfo").textContent=`${dayLabel} • ${shownDays} day${shownDays===1?"":"s"} • ${fmtInt(data.length)} values • Page ${state.page+1} of ${totalPages}`;
+    $("previewInfo").textContent=`${fmtInt(totalDays)} calendar days`;
   }catch(e){error(e)}
 }
+
 function renderTable(id,data){
   const root=$(id);
   if(!data.length){root.innerHTML='<div style="padding:18px;color:#667085">No rows to display.</div>';return}
@@ -576,9 +757,12 @@ async function renderStats(){
     $("statsInfo").textContent="value column";
   }catch(e){error(e);root.innerHTML=""}
 }
-window.changePageSize=()=>{state.page=0;renderPreview()};
+window.changeDaysPerPage=()=>{state.page=0;renderPreview()};
 window.prevPage=()=>{if(state.page>0){state.page--;renderPreview()}};
-window.nextPage=()=>{if((state.page+1)*state.pageSize<state.rowCount){state.page++;renderPreview()}};
+window.nextPage=()=>{
+  const totalPages=Math.max(1,Math.ceil(state.previewDays.length/Math.max(1,state.daysPerPage)));
+  if(state.page+1<totalPages){state.page++;renderPreview()}
+};
 
 window.drawChart=async function(){
   if(!state.current) return;
@@ -662,9 +846,10 @@ window.exportData=window.exportData;
 window.removeCurrent=window.removeCurrent;
 window.selectFile=selectFile;
 window.showTab=window.showTab;
-window.changePageSize=window.changePageSize;
+window.changeDaysPerPage=window.changeDaysPerPage;
 window.prevPage=window.prevPage;
 window.nextPage=window.nextPage;
+window.jumpToDayOfYear=window.jumpToDayOfYear;
 </script>
 </body>
 </html>
