@@ -242,13 +242,15 @@ tbody tr:hover td{background:#fbfdff}
           <div class="export-grid">
             <div class="export-card">
               <h3>CSV</h3>
-              <p>Spreadsheet-friendly text format.</p>
+              <p>Export the complete original table as a standard CSV file.</p>
               <button class="btn primary" onclick="exportData('csv')">Export CSV</button>
             </div>
             <div class="export-card">
-              <h3>Parquet</h3>
-              <p>Efficient columnar format for analysis.</p>
-              <button class="btn primary" onclick="exportData('parquet')">Export Parquet</button>
+              <h3>TRAINSET CSV</h3>
+              <p>Single-series TRAINSET format: series, timestamp, value, label. Downsample 1 keeps every point; 2 keeps every second point; 3 every third point, etc.</p>
+              <label for="trainDownsample" style="display:block;font-size:12px;color:var(--muted);font-weight:600;margin-bottom:6px">Downsample</label>
+              <input id="trainDownsample" class="control" type="number" min="1" step="1" value="1" style="margin-bottom:10px" aria-label="TRAINSET downsample factor">
+              <button class="btn primary" onclick="exportTrainset()">Export TRAINSET CSV</button>
             </div>
             <div class="export-card">
               <h3>JSON</h3>
@@ -800,6 +802,19 @@ window.drawChart=async function(){
   finally{busy(false)}
 };
 
+async function downloadDuckDBFile(virtual,outName,mime){
+  const buf=await state.db.copyFileToBuffer(virtual);
+  const url=URL.createObjectURL(new Blob([buf],{type:mime}));
+  const a=document.createElement("a");
+  a.href=url;
+  a.download=outName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+  try{await state.db.dropFile(virtual)}catch{}
+}
+
 window.exportData=async function(format){
   if(!state.current)return;
   clearError();busy(true);
@@ -808,21 +823,89 @@ window.exportData=async function(format){
   try{
     let virtual,outName,mime;
     if(format==="csv"){
-      virtual=`export_${Date.now()}.csv`; outName=`${base}_export_${stamp}.csv`; mime="text/csv";
+      virtual=`export_${Date.now()}.csv`;
+      outName=`${base}_export_${stamp}.csv`;
+      mime="text/csv";
       await state.conn.query(`COPY (SELECT * FROM current_data) TO ${escLit(virtual)} (FORMAT CSV, HEADER TRUE)`);
-    }else if(format==="parquet"){
-      virtual=`export_${Date.now()}.parquet`; outName=`${base}_export_${stamp}.parquet`; mime="application/octet-stream";
-      await state.conn.query(`COPY (SELECT * FROM current_data) TO ${escLit(virtual)} (FORMAT PARQUET, COMPRESSION ZSTD)`);
     }else{
-      virtual=`export_${Date.now()}.json`; outName=`${base}_export_${stamp}.json`; mime="application/json";
+      virtual=`export_${Date.now()}.json`;
+      outName=`${base}_export_${stamp}.json`;
+      mime="application/json";
       await state.conn.query(`COPY (SELECT * FROM current_data) TO ${escLit(virtual)} (FORMAT JSON, ARRAY TRUE)`);
     }
-    const buf=await state.db.copyFileToBuffer(virtual);
-    const url=URL.createObjectURL(new Blob([buf],{type:mime}));
-    const a=document.createElement("a");a.href=url;a.download=outName;document.body.appendChild(a);a.click();a.remove();
-    setTimeout(()=>URL.revokeObjectURL(url),1000);
-    try{await state.db.dropFile(virtual)}catch{}
+    await downloadDuckDBFile(virtual,outName,mime);
     setStatus(`Exported ${fmtInt(state.rowCount)} rows as ${format.toUpperCase()}`,"ok");
+  }catch(e){error(e)}
+  finally{busy(false)}
+};
+
+window.exportTrainset=async function(){
+  if(!state.current)return;
+  clearError();busy(true);
+
+  const factor=Math.floor(Number($("trainDownsample").value));
+  if(!Number.isFinite(factor)||factor<1){
+    busy(false);
+    error("Downsample must be a whole number of 1 or greater.");
+    return;
+  }
+
+  const timeCol=getPreviewTimeColumn();
+  const valueCol=state.schema.find(c=>c.column_name.toLowerCase()==="value")
+      || state.schema.find(c=>isNumeric(c.column_type));
+
+  if(!timeCol||!valueCol){
+    busy(false);
+    error("TRAINSET export requires a time column (for example Start) and a numeric Value column.");
+    return;
+  }
+
+  const stamp=new Date().toISOString().replaceAll(":","-").slice(0,19);
+  const base=state.current.file.name.replace(/\.(parquet|pq)$/i,"");
+  const virtual=`trainset_${Date.now()}.csv`;
+  const outName=`${base}_trainset_ds${factor}_${stamp}.csv`;
+
+  try{
+    const ts=timestampExpr(timeCol);
+    const valueId=escIdent(valueCol.column_name);
+
+    // Match the attached TRAINSET structure exactly:
+    // series,timestamp,value,label
+    // This viewer contains one measurement series, so every row is series_a.
+    // label is intentionally blank. Downsampling is chronological and deterministic:
+    // factor 1 = all rows, factor 2 = rows 1,3,5..., factor 3 = rows 1,4,7..., etc.
+    await state.conn.query(`
+      COPY (
+        WITH ordered AS (
+          SELECT
+            ${ts} AS ts,
+            TRY_CAST(${valueId} AS DOUBLE) AS value,
+            row_number() OVER (ORDER BY ${ts}) AS rn
+          FROM current_data
+          WHERE ${ts} IS NOT NULL
+        )
+        SELECT
+          'series_a' AS series,
+          strftime(ts, '%Y-%m-%dT%H:%M:%S.000Z') AS timestamp,
+          value,
+          CAST(NULL AS VARCHAR) AS label
+        FROM ordered
+        WHERE ((rn - 1) % ${factor}) = 0
+        ORDER BY rn
+      ) TO ${escLit(virtual)} (FORMAT CSV, HEADER TRUE)
+    `);
+
+    const exported=Number((await rows(`
+      WITH ordered AS (
+        SELECT row_number() OVER (ORDER BY ${ts}) AS rn
+        FROM current_data
+        WHERE ${ts} IS NOT NULL
+      )
+      SELECT count(*) AS n FROM ordered WHERE ((rn - 1) % ${factor}) = 0
+    `))[0].n);
+
+    await downloadDuckDBFile(virtual,outName,"text/csv");
+    setStatus(`Exported ${fmtInt(exported)} TRAINSET rows (downsample ${factor})`,"ok");
   }catch(e){error(e)}
   finally{busy(false)}
 };
@@ -843,6 +926,7 @@ window.removeCurrent=async function(){
 
 window.drawChart=window.drawChart;
 window.exportData=window.exportData;
+window.exportTrainset=window.exportTrainset;
 window.removeCurrent=window.removeCurrent;
 window.selectFile=selectFile;
 window.showTab=window.showTab;
